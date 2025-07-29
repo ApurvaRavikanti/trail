@@ -1,0 +1,34 @@
+using System;
+using System.Linq;
+using System.Text.RegularExpressions;
+
+public static string SanitizeHtmlTags(string input)
+{
+    string[] unwantedWords = { "nvarchar", "script", "javascript", "onclick" };
+    
+    string tagPattern = @"<(?<tag>\w+)(?:\s[^>]*)?>(?<content>.*?)</\k<tag>>";
+    bool foundMatch;
+    
+    do
+    {
+        foundMatch = false;
+        var matches = Regex.Matches(input, tagPattern, RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        
+        foreach (Match match in matches.Cast<Match>().Reverse())
+        {
+            string tagContent = match.Groups["content"].Value;
+            string tagName = match.Groups["tag"].Value;
+            
+            // Check if this specific tag contains malicious words directly in its text
+            if (unwantedWords.Any(word => tagContent.Contains(word, StringComparison.OrdinalIgnoreCase)))
+            {
+                // Replace the tag content with empty content, keeping the tag structure
+                string newTag = $"<{tagName}></{tagName}>";
+                input = input.Remove(match.Index, match.Length).Insert(match.Index, newTag);
+                foundMatch = true;
+            }
+        }
+    } while (foundMatch);
+    
+    return input;
+}
