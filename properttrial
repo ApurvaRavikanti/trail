@@ -46,3 +46,8 @@ string[] unwanted = {
  
         return token;
     }
+
+++++++++++++++++++++++++++++++++++++++++++++++++
+
+string tagPattern = $@"<(?<tag>\w+)(?:[^>]*)>(?:[^<]*(?:{keywords})[^<]*.*?|.*?(?:{keywords}).*?)</\k<tag>>";
+
