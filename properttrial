@@ -1,53 +1,48 @@
-string[] unwanted = {
-            "<script>", "<iframe>", "<embed>", "<object>",
-            ".", "--", ";--", "/*", "*/", "@@",
-            "nchar", "varchar", "nvarchar", "exec", "sysobjects", "syscolumns"
-        };
- 
-        bool ContainsUnwanted(string input) =>
-            unwanted.Any(word => input.IndexOf(word, StringComparison.OrdinalIgnoreCase) >= 0);
- 
-        string RemoveUnwanted(string input)
-        {
-            foreach (var word in unwanted)
-                input = Regex.Replace(input, Regex.Escape(word), "", RegexOptions.IgnoreCase);
-            return input;
-        }
- 
-        if (token.Type == JTokenType.Object)
-        {
-            var obj = (JObject)token;
-            var result = new JObject();
- 
-            foreach (var prop in obj.Properties())
-            {
-                if (prop.Name.Equals("div", StringComparison.OrdinalIgnoreCase) &&
-                    prop.Value.Type == JTokenType.String &&
-                    ContainsUnwanted(prop.Value.ToString()))
-                {
-                    result[prop.Name] = "";
-                }
-                else
-                {
-                    result[prop.Name] = Sanitize(prop.Value);
-                }
-            }
- 
-            return result;
-        }
-        else if (token.Type == JTokenType.Array)
-        {
-            return new JArray(token.Select(Sanitize));
-        }
-        else if (token.Type == JTokenType.String)
-        {
-            return RemoveUnwanted(token.ToString());
-        }
- 
-        return token;
-    }
+private static readonly string[] UnwantedWords = {
+        "nvarchar", "sysobjects", "varchar", ...
+}
 
-++++++++++++++++++++++++++++++++++++++++++++++++
+public static string SanitizeHtmlTags(string input)
+    {
+        if (string.IsNullOrEmpty(input))
+            return input;
 
-string tagPattern = $@"<(?<tag>\w+)(?:[^>]*)>(?:[^<]*(?:{keywords})[^<]*.*?|.*?(?:{keywords}).*?)</\k<tag>>";
+        // First check: if root content contains malicious words, return empty
+        if (HasRootMaliciousContent(input))
+        {
+            Console.WriteLine("Root contamination detected - returning empty string");
+            return string.Empty;
+        }
 
+        // Second step: remove malicious elements
+        string result = input;
+        bool changed;
+        int iterations = 0;
+
+        do
+        {
+            changed = false;
+            iterations++;
+            
+            if (iterations > 20) // Prevent infinite loops
+                break;
+
+            List<HtmlElement> elements = ParseHtmlElements(result);
+            
+            // Check each element for malicious content
+            foreach (var element in elements.OrderByDescending(e => e.StartIndex))
+            {
+                if (ContainsMaliciousWords(element.FullContent))
+                {
+                    // Remove this element completely
+                    result = result.Remove(element.StartIndex, element.Length);
+                    changed = true;
+                    Console.WriteLine($"Removed malicious element: <{element.TagName}>");
+                    break; // Process one element at a time to maintain correct indices
+                }
+            }
+
+        } while (changed);
+
+        return result;
+    }
