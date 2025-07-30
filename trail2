@@ -1,0 +1,35 @@
+public static string SanitizeHtmlTags(string input)
+{
+    // List of unwanted HTML tags
+    var unwantedTags = new[] { "script", "iframe", "embed", "object" };
+    // List of unwanted SQL keywords and characters
+    var unwantedWords = new[] {
+        ".", "--", ";--", "/*", "*/", "@@", "nchar", "varchar", "nvarchar",
+        "exec", "sysobjects", "syscolumns"
+    };
+ 
+    // Remove unwanted HTML tags and their content
+    foreach (var tag in unwantedTags)
+    {
+        string pattern = $@"<\s*{tag}[^>]*>.*?<\s*/\s*{tag}\s*>"; // case-insensitive
+        input = Regex.Replace(input, pattern, "", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+    }
+ 
+    // Remove unwanted SQL keywords and characters
+    foreach (var word in unwantedWords)
+    {
+        input = Regex.Replace(input, Regex.Escape(word), "", RegexOptions.IgnoreCase);
+    }
+ 
+    // Clear "div" property if it contains any unwanted content
+    string divPattern = @"""div""\s*:\s*""([^""]*)""";
+    input = Regex.Replace(input, divPattern, match =>
+    {
+        string divContent = match.Groups[1].Value;
+        bool containsUnwanted = unwantedTags.Any(tag => divContent.Contains(tag, StringComparison.OrdinalIgnoreCase)) ||
+                                unwantedWords.Any(word => divContent.Contains(word, StringComparison.OrdinalIgnoreCase));
+        return containsUnwanted ? @"""div"":""""": match.Value;
+    }, RegexOptions.IgnoreCase);
+ 
+    return input;
+}
