@@ -1,0 +1,132 @@
+pyspark
+import json
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+
+# EventHub connection string
+eventhub_connection = ""
+
+# Starting position configuration
+starting_position = {
+    "offset": "-1",
+    "seqNo": -1,
+    "enqueuedTime": None,
+    "isInclusive": True
+}
+
+# EventHub configuration
+eh_conf = {
+    "eventhubs.connectionString": sc._jvm.org.apache.spark.eventhubs.EventHubsUtils.encrypt(eventhub_connection),
+    "eventhubs.consumerGroup": "$Default",
+    "eventhubs.startingPosition": json.dumps(starting_position)
+}
+
+# Read stream from EventHub
+df = spark.readStream \
+    .format("eventhubs") \
+    .options(**eh_conf) \
+    .load()
+
+# Convert body to string
+raw_df = df.selectExpr("CAST(body AS STRING) as json_str")
+
+# ✅ FIXED: Schema with correct PascalCase field names
+schema = StructType([
+    StructField("MsgId", StringType(), True),
+    StructField("FlowsheetName", StringType(), True),
+    StructField("InputTrigger", StringType(), True),
+    StructField("InputJsonPayload", StringType(), True),
+    StructField("ProcessedHl7Message", StringType(), True),
+    StructField("DateAndTimeOfTransaction", StringType(), True),
+    StructField("AcknowledgmentHl7", StringType(), True),
+    StructField("ErrorDetails", StringType(), True),
+    StructField("HasErrors", BooleanType(), True)
+])
+
+def process_batch(batch_df, batch_id):
+    print(f"Processing batch {batch_id}")
+    
+    if batch_df.isEmpty():
+        print(f"Batch {batch_id} is empty, skipping...")
+        return
+    
+    try:
+        # Parse JSON
+        parsed_df = batch_df.select(
+            from_json(col("json_str"), schema).alias("data")
+        ).select("data.*")
+        
+        # Check if parsing was successful
+        valid_count = parsed_df.filter(col("MsgId").isNotNull()).count()
+        print(f"Batch {batch_id}: {valid_count} valid records after parsing")
+        
+        if valid_count == 0:
+            print(f"Batch {batch_id}: No valid records, logging raw data")
+            batch_df.write \
+                .format("delta") \
+                .mode("append") \
+                .saveAsTable("databricks_ap_workspace1.eventhub_demo.events_raw_debug")
+            return
+        
+        # ✅ FIXED: Transform with correct column names
+        final_df = parsed_df.select(
+            col("MsgId").alias("msgId"),
+            col("FlowsheetName").alias("flowsheetName"),
+            col("InputTrigger").alias("inputTrigger"),
+            col("InputJsonPayload").alias("inputJsonPayload"),
+            col("ProcessedHl7Message").alias("processedHl7Message"),
+            to_timestamp(col("DateAndTimeOfTransaction")).alias("dateAndTimeOfTransaction"),
+            col("AcknowledgmentHl7").alias("acknowledgmentHl7"),
+            col("ErrorDetails").alias("errorDetails"),
+            col("HasErrors").alias("hasErrors")
+        )
+        
+        # Split success and error records
+        success_df = final_df.filter(col("hasErrors") == False)
+        error_df = final_df.filter(col("hasErrors") == True)
+        
+        # Write success records
+        success_count = success_df.count()
+        if success_count > 0:
+            success_df.write \
+                .format("delta") \
+                .mode("append") \
+                .saveAsTable("databricks_ap_workspace1.eventhub_demo.epic_flowsheet_data")
+            print(f"Batch {batch_id}: Wrote {success_count} success records")
+        
+        # Write error records
+        error_count = error_df.count()
+        if error_count > 0:
+            error_df.write \
+                .format("delta") \
+                .mode("append") \
+                .saveAsTable("databricks_ap_workspace1.eventhub_demo.events_error")
+            print(f"Batch {batch_id}: Wrote {error_count} error records")
+            
+    except Exception as e:
+        print(f"Batch {batch_id} failed with error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        # Write entire batch to error table
+        batch_df.withColumn("error_reason", lit(str(e))) \
+            .withColumn("batch_id", lit(batch_id)) \
+            .write \
+            .format("delta") \
+            .mode("append") \
+            .saveAsTable("databricks_ap_workspace1.eventhub_demo.events_processing_errors")
+
+# Start streaming query
+query = raw_df.writeStream \
+    .foreachBatch(process_batch) \
+    .option("checkpointLocation", "/Volumes/databricks_ap_workspace1/eventhub_demo/checkpoints/events_v7") \
+    .trigger(processingTime="10 seconds") \
+    .start()
+
+print("✅ Streaming query started successfully!")
+print(f"Query ID: {query.id}")
+print(f"Query Name: {query.name}")
+print(f"Status: {query.status}")
+
+# Optional: Wait for termination
+# query.awaitTermination()
