@@ -1,0 +1,81 @@
+using System;
+using System.Text;
+using System.Text.Json;
+using Azure.Messaging.EventHubs;
+using Azure.Messaging.EventHubs.Producer;
+using EventHub_Databricks_Streaming.Models;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.Logging;
+
+namespace EventHub_Databricks_Streaming;
+public class Function1
+{
+    private readonly ILogger<Function1> _logger;
+    private readonly EventHubProducerClient _producerClient;
+
+    public Function1(ILogger<Function1> logger)
+    {
+        _logger = logger;
+
+        string eventHub2Connection = Environment.GetEnvironmentVariable("EventHub2Connection");
+        string eventHub2Name = "eventhub2";
+        _producerClient = new EventHubProducerClient(eventHub2Connection, eventHub2Name);
+    }
+
+    [Function(nameof(Function1))]
+    public async Task Run([EventHubTrigger("apeventhub1", Connection = "EventHub1Connection")] EventData[] events)
+    {
+        _logger.LogInformation($"Received {events.Length} events");
+
+        EventDataBatch batch = await _producerClient.CreateBatchAsync();
+        foreach (EventData evt in events)
+        {
+            string inputMessage = Encoding.UTF8.GetString(evt.Body.ToArray());
+
+            _logger.LogInformation("Received EventHub1 message: {message}", inputMessage);
+            if(String.IsNullOrEmpty(inputMessage))
+            {
+                return;
+            }
+
+            Hl7DbRecord payload = JsonSerializer.Deserialize<Hl7DbRecord>(
+                inputMessage,
+                new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                });
+            // optional: update transaction datetime before sending
+            payload.DateAndTimeOfTransaction = DateTime.UtcNow;
+
+            string outputMessage = JsonSerializer.Serialize(payload);
+
+            EventData outputEvent = new EventData(Encoding.UTF8.GetBytes(outputMessage))
+            {
+                ContentType = "application/json"
+            };
+
+            if (!batch.TryAdd(outputEvent))
+            {
+                await _producerClient.SendAsync(batch);
+
+                batch.Dispose();
+                batch = await _producerClient.CreateBatchAsync();
+
+                if (!batch.TryAdd(outputEvent))
+                {
+                    _logger.LogError("Single message is too large to send to EventHub2. MsgId: {msgId}", payload.MsgId);
+                }
+            }
+        }
+
+        if (batch.Count > 0)
+        {
+            await _producerClient.SendAsync(batch);
+        }
+
+        batch.Dispose();
+
+        _logger.LogInformation("Messages sent to EventHub2 successfully.");
+    }
+
+}
