@@ -1,0 +1,157 @@
+import json
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+
+# EventHub connection string
+eventhub_connection = ""
+
+# Starting position configuration
+starting_position = {
+    "offset": "-1",
+    "seqNo": -1,
+    "enqueuedTime": None,
+    "isInclusive": True
+}
+
+# EventHub configuration
+eh_conf = {
+    "eventhubs.connectionString": sc._jvm.org.apache.spark.eventhubs.EventHubsUtils.encrypt(eventhub_connection),
+    "eventhubs.consumerGroup": "$Default",
+    "eventhubs.startingPosition": json.dumps(starting_position)
+}
+
+# Read stream from EventHub
+# ikkada eventhubs ante adi eventhub type data nu stream chey an ichepthunna more like int or string type laga eventuhb type of data ni thechko ani chepthunna
+# options (**eh_conf) ante eh_conf lo unna options ni unpack chesthunnam annattu
+# ante inka okko function variables ki eh_config lo unna options assign chesthunnattu
+df = spark.readStream \
+    .format("eventhubs") \
+    .options(**eh_conf) \
+    .load()
+
+# Convert body to string
+#Ikkada df anedi motham response object andulo response body ochi ikkada "body" variable ee body variable ni string laga convert chesi oka kotha column ki assign chesthunnaru
+# ee kotha column ni assign cheyyakunda kuda pani avthundi kakapothe prathisari CAST(body as string) ane badalu easy reference kosam json_str ani rasaru
+# manaki eventhub nundi response bosy bytes format lo osthundi manam further process cheyyalante string lo kavali so adi anduke convert chesthunnam
+raw_df = df.selectExpr("CAST(body AS STRING) as json_str")
+
+# ✅ FIXED: Schema with correct PascalCase field names
+# idi just json structire define chesthunnam anthe nothing much
+schema = StructType([
+    StructField("MsgId", StringType(), True),
+    StructField("FlowsheetName", StringType(), True),
+    StructField("InputTrigger", StringType(), True),
+    StructField("InputJsonPayload", StringType(), True),
+    StructField("ProcessedHl7Message", StringType(), True),
+    StructField("DateAndTimeOfTransaction", StringType(), True),
+    StructField("AcknowledgmentHl7", StringType(), True),
+    StructField("ErrorDetails", StringType(), True),
+    StructField("HasErrors", BooleanType(), True)
+])
+
+def process_batch(batch_df, batch_id):
+    print(f"Processing batch {batch_id}")
+    
+    if batch_df.isEmpty():
+        print(f"Batch {batch_id} is empty, skipping...")
+        return
+    
+    try:
+        # Parse JSON
+        parsed_df = batch_df.select(
+            from_json(col("json_str"), schema).alias("data")
+        ).select("data.*")
+        
+        # Check if parsing was successful
+		# okavela parsing fail aithe MSGID null untundi appudu automatic ga notnull unna record 0 avthayi
+        valid_count = parsed_df.filter(col("MsgId").isNotNull()).count()
+        print(f"Batch {batch_id}: {valid_count} valid records after parsing")
+        
+		#okavela MSGID not null unna records lekunda unte count =0 avthundi appudu printf execute chesthundi
+		#next count ==0 undi kabatti aa batch_df lo unna records annitini delta format lo events_raw_debug ane table lo ki "Append chesthundi" 
+		# ante old records ni alane unchi just ee kotham records ni aa table lo save chesthundi
+		# IKkada Databricks default ga delta format ee use chesthundi table ki save cheyyadanki more like a file format anthe
+        if valid_count == 0:
+            print(f"Batch {batch_id}: No valid records, logging raw data")
+            batch_df.write \
+                .format("delta") \
+                .mode("append") \
+                .saveAsTable("databricks_ap_workspace1.eventhub_demo.events_raw_debug")
+            return
+        
+        # ✅ FIXED: Transform with correct column names
+		#ikkada manam paina struct use chesi json format with Values create chesam kada aa field values databricks columns ki match ayyelaga alias chesthunnam anthe
+        final_df = parsed_df.select(
+            col("MsgId").alias("msgId"),
+            col("FlowsheetName").alias("flowsheetName"),
+            col("InputTrigger").alias("inputTrigger"),
+            col("InputJsonPayload").alias("inputJsonPayload"),
+            col("ProcessedHl7Message").alias("processedHl7Message"),
+            to_timestamp(col("DateAndTimeOfTransaction")).alias("dateAndTimeOfTransaction"),
+            col("AcknowledgmentHl7").alias("acknowledgmentHl7"),
+            col("ErrorDetails").alias("errorDetails"),
+            col("HasErrors").alias("hasErrors")
+        )
+        
+        # Split success and error records
+		#ikkada hasErrors ane column lo false unna rows matram thiskoni success_df lo store chey
+		# hasErrors column lo true unna rows matrame thiskoni error_df lo store chey
+        success_df = final_df.filter(col("hasErrors") == False)
+        error_df = final_df.filter(col("hasErrors") == True)
+        
+        # Write success records
+        success_count = success_df.count()
+        if success_count > 0:
+            success_df.write \
+                .format("delta") \
+                .mode("append") \
+                .saveAsTable("databricks_ap_workspace1.eventhub_demo.epic_flowsheet_data")
+            print(f"Batch {batch_id}: Wrote {success_count} success records")
+        
+        # Write error records
+        error_count = error_df.count()
+        if error_count > 0:
+            error_df.write \
+                .format("delta") \
+                .mode("append") \
+                .saveAsTable("databricks_ap_workspace1.eventhub_demo.events_error")
+            print(f"Batch {batch_id}: Wrote {error_count} error records")
+      #this is more like catch ee point lo exception vachina ee block catch chesthundi anthe      
+    except Exception as e:
+        print(f"Batch {batch_id} failed with error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        # Write entire batch to error table
+		# Exception vachina batch records anni ee table lo store avthayi 
+		#idi store ayi next batch run avthundi edo pedda memory issue lantivi osthe matrame job aaguthundi lekapothe aagadu
+        batch_df.withColumn("error_reason", lit(str(e))) \
+            .withColumn("batch_id", lit(batch_id)) \
+            .write \
+            .format("delta") \
+            .mode("append") \
+            .saveAsTable("databricks_ap_workspace1.eventhub_demo.events_processing_errors")
+
+# Start streaming query
+#start annappudu job start aithadi run avvadam eventhub every 10 seconds ki check cheyyamani Trigger lo chepthunnam 
+#option emo checkpoint location ante last ga ee msg ni process chesindi aa location Events_v7 lo offsets ante folder lo store chesi petkuntundi
+# process_batch ane function ni call chesthundi for each batch
+query = raw_df.writeStream \
+    .foreachBatch(process_batch) \
+    .option("checkpointLocation", "/Volumes/databricks_ap_workspace1/eventhub_demo/checkpoints/events_v7") \
+    .trigger(processingTime="10 seconds") \
+    .start()
+
+print("✅ Streaming query started successfully!")
+print(f"Query ID: {query.id}")
+print(f"Query Name: {query.name}")
+print(f"Status: {query.status}")
+
+# Optional: Wait for termination
+# query.awaitTermination()
+
+#EventHub nundi bytes data vastundi
+#CAST chesi string chesthunnam
+#StructType schema use chesi JSON fields ga parse chesthunnam
+#alias() use chesi table column names ki match chesthunnam
+#Final data Databricks table lo append chesthunnam
