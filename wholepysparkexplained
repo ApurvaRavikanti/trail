@@ -3,7 +3,7 @@ from pyspark.sql.functions import *
 from pyspark.sql.types import *
 
 # EventHub connection string
-eventhub_connection = ""
+eventhub_connection = "Endpoint=sb://apn/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=4E=;EntityPath=eventhub2"
 
 # Starting position configuration
 starting_position = {
