@@ -1,0 +1,49 @@
+raw_df
+| json_str                            |
+| ----------------------------------- |
+| `{"MsgId":"1","FlowsheetName":"A"}` |
+| `{"MsgId":"2","FlowsheetName":"B"}` |
+
+
+Parsed_df 
+
+| MsgId | FlowsheetName |
+| ----- | ------------- |
+| 1     | A             |
+| 2     | B             |
+
+
+final_df
+
+col("MsgId").alias("msgId")
+
+| msgId | flowsheetName |
+| ----- | ------------- |
+| 1     | A             |
+| 2     | B             |
+
+
+so batch lo unna okkokka record process aina koddi aa paisa Parse_df lo rows add aithaa untayi
+
+last lo okatesari just column name change aithadi
+
+has errors ila each row ki oka haserrors values untadi
+
+| msgId | flowsheetName | dateTime   | hasErrors |
+| ----- | ------------- | ---------- | --------- |
+| 2     | SugarTest     | 2026-05-03 | true      |
+
+
+EventHub events
+   ↓
+raw_df
+(body → string)
+   ↓
+writeStream
+("ee stream ni process cheyyi")
+   ↓
+foreachBatch
+("prathi batch ki ee function call cheyyi")
+   ↓
+start()
+("actual ga run cheyyi")
