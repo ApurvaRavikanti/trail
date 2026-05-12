@@ -1,0 +1,239 @@
+import json
+import base64
+import tempfile
+import os
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from azure.identity import DefaultAzureCredential
+from azure.keyvault.secrets import SecretClient
+
+# ============================================
+# Key Vault Configuration
+# ============================================
+KEY_VAULT_URL = "https://your-keyvault-name.vault.azure.net/"
+CERT_SECRET_NAME = "dummyCert"
+CERT_PASSWORD_SECRET_NAME = "dummyCertPwd"
+
+# ============================================
+# Event Hub Configuration
+# ============================================
+EVENTHUB_NAMESPACE = "apnamespace2.servicebus.windows.net"
+EVENTHUB_NAME = "eventhub2"
+CONSUMER_GROUP = "$Default"
+
+# ============================================
+# Databricks Configuration
+# ============================================
+CHECKPOINT_LOCATION = "/Volumes/databricks_ap_workspace1/eventhub_demo/checkpoints/kafka_events_v1"
+SUCCESS_TABLE = "databricks_ap_workspace1.eventhub_demo.epic_flowsheet_data"
+ERROR_TABLE = "databricks_ap_workspace1.eventhub_demo.events_error"
+PROCESSING_ERROR_TABLE = "databricks_ap_workspace1.eventhub_demo.events_processing_errors"
+RAW_DEBUG_TABLE = "databricks_ap_workspace1.eventhub_demo.events_raw_debug"
+
+def get_certificate_from_keyvault():
+    """
+    Retrieves certificate and password from Azure Key Vault
+    Returns: tuple (cert_path, cert_password)
+    """
+    try:
+        print("🔐 Connecting to Key Vault...")
+        credential = DefaultAzureCredential()
+        secret_client = SecretClient(vault_url=KEY_VAULT_URL, credential=credential)
+        
+        print("📥 Retrieving certificate password...")
+        cert_pwd_secret = secret_client.get_secret(CERT_PASSWORD_SECRET_NAME)
+        cert_password = cert_pwd_secret.value
+        
+        print("📥 Retrieving certificate...")
+        cert_secret = secret_client.get_secret(CERT_SECRET_NAME)
+        cert_base64 = cert_secret.value
+        
+        if not cert_base64 or not cert_password:
+            raise Exception("Certificate or password missing in Key Vault")
+        
+        print("🔄 Decoding certificate from Base64...")
+        cert_bytes = base64.b64decode(cert_base64)
+        
+        print("💾 Writing certificate to temporary file...")
+        temp_cert_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pfx')
+        temp_cert_file.write(cert_bytes)
+        temp_cert_file.close()
+        
+        print(f"✅ Certificate loaded successfully: {temp_cert_file.name}")
+        return temp_cert_file.name, cert_password
+        
+    except Exception as ex:
+        raise Exception(f"❌ Failed to load certificate from Key Vault: {str(ex)}")
+
+def get_kafka_options(cert_path, cert_password):
+    """
+    Creates Kafka configuration for Event Hub with certificate authentication
+    """
+    # Event Hub Kafka endpoint
+    bootstrap_servers = f"{EVENTHUB_NAMESPACE}:9093"
+    
+    # SASL/SSL Configuration with certificate
+    kafka_options = {
+        "kafka.bootstrap.servers": bootstrap_servers,
+        "kafka.security.protocol": "SASL_SSL",
+        "kafka.sasl.mechanism": "PLAIN",
+        "kafka.sasl.jaas.config": f'org.apache.kafka.common.security.plain.PlainLoginModule required username="$ConnectionString" password="Endpoint=sb://{EVENTHUB_NAMESPACE}/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=YOUR_KEY;EntityPath={EVENTHUB_NAME}";',
+        "subscribe": EVENTHUB_NAME,
+        "kafka.group.id": CONSUMER_GROUP,
+        "startingOffsets": "earliest",
+        "failOnDataLoss": "false",
+        
+        # SSL Certificate Configuration
+        "kafka.ssl.truststore.location": cert_path,
+        "kafka.ssl.truststore.password": cert_password,
+        "kafka.ssl.keystore.location": cert_path,
+        "kafka.ssl.keystore.password": cert_password,
+        "kafka.ssl.key.password": cert_password
+    }
+    
+    return kafka_options
+
+# ============================================
+# Schema Definition
+# ============================================
+schema = StructType([
+    StructField("MsgId", StringType(), True),
+    StructField("FlowsheetName", StringType(), True),
+    StructField("InputTrigger", StringType(), True),
+    StructField("InputJsonPayload", StringType(), True),
+    StructField("ProcessedHl7Message", StringType(), True),
+    StructField("DateAndTimeOfTransaction", StringType(), True),
+    StructField("AcknowledgmentHl7", StringType(), True),
+    StructField("ErrorDetails", StringType(), True),
+    StructField("HasErrors", BooleanType(), True)
+])
+
+def process_batch(batch_df, batch_id):
+    """
+    Process each batch of streaming data
+    """
+    print(f"📦 Processing batch {batch_id}")
+    
+    if batch_df.isEmpty():
+        print(f"⚠️ Batch {batch_id} is empty, skipping...")
+        return
+    
+    try:
+        # Parse JSON from Kafka value
+        parsed_df = batch_df.select(
+            from_json(col("value").cast("string"), schema).alias("data")
+        ).select("data.*")
+        
+        # Check if parsing was successful
+        valid_count = parsed_df.filter(col("MsgId").isNotNull()).count()
+        print(f"✅ Batch {batch_id}: {valid_count} valid records after parsing")
+        
+        if valid_count == 0:
+            print(f"⚠️ Batch {batch_id}: No valid records, logging raw data")
+            batch_df.write \
+                .format("delta") \
+                .mode("append") \
+                .saveAsTable(RAW_DEBUG_TABLE)
+            return
+        
+        # Transform with correct column names
+        final_df = parsed_df.select(
+            col("MsgId").alias("msgId"),
+            col("FlowsheetName").alias("flowsheetName"),
+            col("InputTrigger").alias("inputTrigger"),
+            col("InputJsonPayload").alias("inputJsonPayload"),
+            col("ProcessedHl7Message").alias("processedHl7Message"),
+            to_timestamp(col("DateAndTimeOfTransaction")).alias("dateAndTimeOfTransaction"),
+            col("AcknowledgmentHl7").alias("acknowledgmentHl7"),
+            col("ErrorDetails").alias("errorDetails"),
+            col("HasErrors").alias("hasErrors")
+        )
+        
+        # Split success and error records
+        success_df = final_df.filter(col("hasErrors") == False)
+        error_df = final_df.filter(col("hasErrors") == True)
+        
+        # Write success records
+        success_count = success_df.count()
+        if success_count > 0:
+            success_df.write \
+                .format("delta") \
+                .mode("append") \
+                .saveAsTable(SUCCESS_TABLE)
+            print(f"✅ Batch {batch_id}: Wrote {success_count} success records")
+        
+        # Write error records
+        error_count = error_df.count()
+        if error_count > 0:
+            error_df.write \
+                .format("delta") \
+                .mode("append") \
+                .saveAsTable(ERROR_TABLE)
+            print(f"⚠️ Batch {batch_id}: Wrote {error_count} error records")
+            
+    except Exception as e:
+        print(f"❌ Batch {batch_id} failed with error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        # Write entire batch to error table
+        batch_df.withColumn("error_reason", lit(str(e))) \
+            .withColumn("batch_id", lit(batch_id)) \
+            .write \
+            .format("delta") \
+            .mode("append") \
+            .saveAsTable(PROCESSING_ERROR_TABLE)
+
+# ============================================
+# Main Execution
+# ============================================
+try:
+    print("=" * 60)
+    print("🚀 Starting Event Hub to Databricks Streaming Job")
+    print("=" * 60)
+    
+    # Step 1: Get certificate from Key Vault
+    cert_path, cert_password = get_certificate_from_keyvault()
+    
+    # Step 2: Configure Kafka options
+    print("⚙️ Configuring Kafka connector...")
+    kafka_options = get_kafka_options(cert_path, cert_password)
+    
+    # Step 3: Read stream from Event Hub via Kafka
+    print("📡 Connecting to Event Hub via Kafka...")
+    df = spark.readStream \
+        .format("kafka") \
+        .options(**kafka_options) \
+        .load()
+    
+    print("✅ Successfully connected to Event Hub!")
+    
+    # Step 4: Start streaming query
+    print("▶️ Starting streaming query...")
+    query = df.writeStream \
+        .foreachBatch(process_batch) \
+        .option("checkpointLocation", CHECKPOINT_LOCATION) \
+        .trigger(processingTime="10 seconds") \
+        .start()
+    
+    print("=" * 60)
+    print("✅ Streaming query started successfully!")
+    print(f"📋 Query ID: {query.id}")
+    print(f"📋 Query Name: {query.name}")
+    print(f"📊 Status: {query.status}")
+    print("=" * 60)
+    
+    # Optional: Wait for termination
+    # query.awaitTermination()
+    
+except Exception as e:
+    print("=" * 60)
+    print(f"❌ Failed to start streaming job: {str(e)}")
+    print("=" * 60)
+    import traceback
+    traceback.print_exc()
+    
+    # Cleanup certificate file if exists
+    if 'cert_path' in locals() and os.path.exists(cert_path):
+        os.unlink(cert_path)
+        print(f"🧹 Cleaned up temporary certificate file")
